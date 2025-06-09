@@ -3,12 +3,38 @@ import json
 import os
 import zipfile
 from datetime import datetime, timedelta
-from typing import Optional, Dict, Iterator
 import io
+import socket
+import threading
 
+class NetworkClient:
+
+    def __init__(self, host, port):
+        self.host = host
+        self.port = port
+        self.sock = None
+        self.lock = threading.Lock()
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.connect((self.host, self.port))
+
+    def send(self, data_dict):
+        import json
+        try:
+            msg = json.dumps(data_dict) + "\n"
+            with self.lock:
+                self.sock.sendall(msg.encode())
+        except Exception as e:
+            print(f"[NetworkClient] Błąd wysyłki danych: {e}")
+
+    def close(self):
+        if self.sock:
+            self.sock.close()
+            self.sock = None
 
 class Logger:
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, server_host: str, server_port: int):
         with open(config_path) as f:
             config = json.load(f)
         self.log_dir = config['log_dir']
@@ -24,11 +50,14 @@ class Logger:
 
         self.buffer = []
         self.current_file = None
-        self.current_writer = None
         self.current_filename = None
         self.current_size = 0
         self.line_count = 0
         self.next_rotation_time = None
+
+        # Sieć
+        self.network_client = NetworkClient(server_host, server_port)
+        self.network_client.connect()
 
     def start(self):
         self._rotate()
@@ -38,8 +67,8 @@ class Logger:
         if self.current_file:
             self.current_file.close()
             self.current_file = None
-            self.current_writer = None
             self.current_filename = None
+        self.network_client.close()
 
     def log_reading(self, sensor_id: str, timestamp: datetime, value: float, unit: str):
         self.buffer.append((timestamp, sensor_id, value, unit))
@@ -47,47 +76,17 @@ class Logger:
             self._flush_buffer()
         self._check_rotation()
 
-    def read_logs(self, start: datetime, end: datetime, sensor_id: Optional[str] = None) -> Iterator[Dict]:
-        for dir_path in [self.log_dir, os.path.join(self.log_dir, 'archive')]:
-            if not os.path.exists(dir_path):
-                continue
-            for filename in os.listdir(dir_path):
-                file_path = os.path.join(dir_path, filename)
-                if filename.endswith('.csv'):
-                    yield from self._read_csv(file_path, start, end, sensor_id)
-                elif filename.endswith('.zip'):
-                    yield from self._read_zip(file_path, start, end, sensor_id)
-
-    def _read_csv(self, file_path, start, end, sensor_id):
-        with open(file_path, 'r') as f:
-            reader = csv.reader(f)
-            next(reader)
-            for row in reader:
-                timestamp = datetime.fromisoformat(row[0])
-                if start <= timestamp <= end and (sensor_id is None or row[1] == sensor_id):
-                    yield {
-                        "timestamp": timestamp,
-                        "sensor_id": row[1],
-                        "value": float(row[2]),
-                        "unit": row[3]
-                    }
-
-    def _read_zip(self, file_path, start, end, sensor_id):
-        with zipfile.ZipFile(file_path, 'r') as zf:
-            for name in zf.namelist():
-                if name.endswith('.csv'):
-                    with zf.open(name) as f:
-                        reader = csv.reader(io.TextIOWrapper(f))
-                        next(reader)
-                        for row in reader:
-                            timestamp = datetime.fromisoformat(row[0])
-                            if start <= timestamp <= end and (sensor_id is None or row[1] == sensor_id):
-                                yield {
-                                    "timestamp": timestamp,
-                                    "sensor_id": row[1],
-                                    "value": float(row[2]),
-                                    "unit": row[3]
-                                }
+    def log_and_send(self, sensor_id, timestamp, value, unit):
+        self.log_reading(sensor_id, timestamp, value, unit)
+        try:
+            self.network_client.send({
+                "timestamp": timestamp.isoformat(),
+                "sensor_id": sensor_id,
+                "value": value,
+                "unit": unit
+            })
+        except Exception as e:
+            print(f"[Logger] Błąd wysyłania danych do serwera: {e}")
 
     def _flush_buffer(self):
         if not self.current_file:
@@ -124,7 +123,10 @@ class Logger:
             self._rotate()
 
     def _rotate(self):
-        self.stop()
+        self._flush_buffer()
+        if self.current_file:
+            self.current_file.close()
+            self.current_file = None
         if self.current_filename:
             source = os.path.join(self.log_dir, self.current_filename)
             if os.path.exists(source):
@@ -140,9 +142,10 @@ class Logger:
 
     def _clean_old_archives(self):
         cutoff = datetime.now() - timedelta(days=self.retention_days)
-        for filename in os.listdir(os.path.join(self.log_dir, 'archive')):
+        archive_dir = os.path.join(self.log_dir, 'archive')
+        for filename in os.listdir(archive_dir):
             if filename.endswith('.zip'):
-                path = os.path.join(self.log_dir, 'archive', filename)
+                path = os.path.join(archive_dir, filename)
                 mtime = datetime.fromtimestamp(os.path.getmtime(path))
                 if mtime < cutoff:
                     os.remove(path)

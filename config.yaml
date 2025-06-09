@@ -1,0 +1,8 @@
+network_client:
+  host: "127.0.0.1"
+  port: 9000
+  timeout: 5.0
+  retries: 3
+
+network_server:
+  port: 9000
